@@ -22,6 +22,54 @@ import streamlit as st
 
 st.set_page_config(page_title="台股智慧對帳損益監控系統", page_icon="📈", layout="wide")
 
+# 全頁共用的即時台灣時間顯示器
+st.components.v1.html(
+    """
+    <script>
+      // 將時鐘直接掛到 Streamlit 主文件，避免只固定在元件 iframe 內。
+      const hostDocument = window.parent.document;
+      let clock = hostDocument.getElementById("taiwan-clock");
+      if (!clock) {
+        clock = hostDocument.createElement("div");
+        clock.id = "taiwan-clock";
+        clock.innerHTML = '台灣時間 <span id="taiwan-clock-value"></span>';
+        Object.assign(clock.style, {
+          position: "fixed",
+          top: "56px",
+          right: "24px",
+          zIndex: "999999",
+          padding: "8px 12px",
+          borderRadius: "8px",
+          background: "rgba(20, 25, 35, 0.92)",
+          color: "#fff",
+          font: "600 14px/1.4 sans-serif",
+          whiteSpace: "nowrap",
+          boxShadow: "0 2px 10px rgba(0, 0, 0, 0.25)"
+        });
+        hostDocument.body.appendChild(clock);
+      }
+      const clockValue = clock.querySelector("#taiwan-clock-value");
+      const taiwanTimeFormatter = new Intl.DateTimeFormat("sv-SE", {
+        timeZone: "Asia/Taipei",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23"
+      });
+      function updateTaiwanClock() {
+        clockValue.textContent = taiwanTimeFormatter.format(new Date());
+      }
+      updateTaiwanClock();
+      setInterval(updateTaiwanClock, 1000);
+    </script>
+    """,
+    height=0,
+    scrolling=False,
+)
+
 # 台股紅漲綠跌（依規格：賺錢紅 #FF4B4B、賠錢綠 #00E676）
 GAIN = "#FF4B4B"   # 賺錢 / 上漲 紅
 LOSS = "#00E676"   # 賠錢 / 下跌 綠
