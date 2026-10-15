@@ -955,26 +955,43 @@ elif st.session_state.page == "stats":
         }
         stats_df = pd.DataFrame(rows + [total_row])
 
-        def _fmt_price(v):
-            return "—" if pd.isna(v) else f"{v:,.2f}"
+        def _fmt_stat_number(v, signed=False):
+            if pd.isna(v):
+                return "—"
+            if v == 0:
+                return "0"
+            return f"{v:+,.2f}" if signed else f"{v:,.2f}"
+
+        def _fmt_stat_ratio(v):
+            if pd.isna(v):
+                return "—"
+            return "0" if v == 0 else f"{v * 100:+.2f}%"
 
         stats_styler = (
             stats_df.style
             .set_table_styles(STYLER_BASE)
             .apply(tint, subset=["損益金額", "損益比例"], color_of=lambda v: GAIN if v >= 0 else LOSS)
-            .format({"股數": "{:,.0f}", "均價": _fmt_price, "現價": _fmt_price,
-                     "市值": "{:,.0f}", "損益金額": "{:+,.0f}", "損益比例": lambda v: f"{v * 100:+.2f}%"})
+            .format({
+                "股數": _fmt_stat_number,
+                "均價": _fmt_stat_number,
+                "現價": _fmt_stat_number,
+                "市值": _fmt_stat_number,
+                "損益金額": lambda v: _fmt_stat_number(v, signed=True),
+                "損益比例": _fmt_stat_ratio,
+                "已實現損益": lambda v: _fmt_stat_number(v, signed=True),
+                "總成本": _fmt_stat_number,
+            }, na_rep="—")
         )
         show_dataframe(
             stats_styler,
             column_config={
                 "代號": st.column_config.TextColumn("代號", width="small"),
                 "名稱": st.column_config.TextColumn("名稱", width="small"),
-                "股數": st.column_config.NumberColumn("股數", format="%d"),
+                "股數": st.column_config.TextColumn("股數"),
                 "均價": st.column_config.TextColumn("均價（NT$）"),
                 "現價": st.column_config.TextColumn("現價（NT$）"),
-                "市值": st.column_config.NumberColumn("市值（NT$）", format="%d"),
-                "損益金額": st.column_config.NumberColumn("損益金額（NT$）"),
+                "市值": st.column_config.TextColumn("市值（NT$）"),
+                "損益金額": st.column_config.TextColumn("損益金額（NT$）"),
                 "損益比例": st.column_config.TextColumn("損益比例"),
             },
             caption="紅字＝賺錢、綠字＝賠錢（台股配色）。可用表格右上角 ⋯ 複製貼到 Numbers。",
@@ -1039,16 +1056,25 @@ elif get_stock(st.session_state.page) is not None:
             .set_table_styles(STYLER_BASE)
             .apply(_ledger_row_style(tx_types), axis=None)
             .format({
-                "購買單價": "{:,.2f}", "賣出單價": "{:,.2f}",
-                "打平成本預估單價": "{:,.2f}", "預留即時現價": "{:,.2f}", "停損價位": "{:,.2f}",
-                "投資報酬率": lambda v: f"{v * 100:+.2f}%",
-                "帳上收益": "{:+,.0f}", "剩餘成本": "{:,.0f}",
+                **{
+                    column: lambda value: "0" if value == 0 else f"{value:,.2f}"
+                    for column in (
+                        "購買單價", "賣出單價", "打平成本預估單價",
+                        "預留即時現價", "停損價位",
+                    )
+                },
+                "投資報酬率": lambda value: "0" if value == 0 else f"{value * 100:+.2f}%",
+                "帳上收益": lambda value: "0" if value == 0 else f"{value:+,.0f}",
+                **{
+                    column: lambda value: "0" if value == 0 else f"{value:,.0f}"
+                    for column in (
+                        "購買股數", "購買金額", "手續費", "購買成本",
+                        "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額",
+                        "股息發放", "20K以上二代健保2.11%", "(匯費/手續費)",
+                        "實際領到", "剩餘成本", "庫存股數",
+                    )
+                },
             }, na_rep="—")
-            .format({c: "{:,.0f}" for c in
-                     ("購買股數", "購買金額", "手續費", "購買成本",
-                      "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額",
-                      "股息發放", "20K以上二代健保2.11%", "(匯費/手續費)", "實際領到", "庫存股數")},
-                    na_rep="—")
         )
         # 欄寬微調（右側策略備註欄留較寬）
         ledger_cfg = {
