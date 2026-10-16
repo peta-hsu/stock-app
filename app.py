@@ -12,6 +12,7 @@
 """
 
 import math
+import json
 import random
 import sqlite3
 from datetime import date, datetime
@@ -113,7 +114,6 @@ def sell_tax(gross: float) -> float:
     if gross <= 0:
         return 0.0
     return float(_floor(gross * TAX_RATE))
-
 
 def supp_health(cash_dividend: float) -> float:
     """二代健保補充保費：單筆現金股利 ≥ 20,000 才扣 2.11%（四捨五入至整數），否則 0。"""
@@ -260,6 +260,87 @@ def record_trade(trade_date, code, name, tx_type, unit_price, shares, tail_adjus
     }
 
 
+def update_trades(updates):
+    """更新流水帳原始欄位，並依交易類型重算所有費用與淨現金流。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for item in updates:
+            trade_id = int(item["id"])
+            existing = conn.execute(
+                "SELECT tx_type, tail_adjust FROM trades WHERE id = ?", (trade_id,)
+            ).fetchone()
+            if existing is None:
+                raise ValueError(f"找不到交易紀錄：{trade_id}")
+
+            tx_type, tail_adjust = existing
+            unit_price = float(item["unit_price"])
+            shares_value = float(item["shares"])
+            stop_loss = float(item["stop_loss"])
+            if not all(math.isfinite(value) for value in (unit_price, shares_value, stop_loss)):
+                raise ValueError("價格、股數與停損價位必須是有效數字")
+            if shares_value <= 0 or not shares_value.is_integer():
+                raise ValueError("股數必須是大於 0 的整數")
+            if stop_loss < 0:
+                raise ValueError("停損價位不可小於 0")
+            if (tx_type in ("買進", "賣出") and unit_price <= 0) or (
+                tx_type == "配息" and unit_price < 0
+            ):
+                raise ValueError("交易單價必須大於 0，股息金額不可小於 0")
+
+            shares = int(shares_value)
+            gross = unit_price * shares
+            b_fee = s_fee = tax = supp = remit = 0.0
+            if tx_type == "買進":
+                b_fee = buy_fee(gross)
+                net = -(gross + b_fee) + tail_adjust
+            elif tx_type == "賣出":
+                s_fee = sell_fee(gross)
+                tax = sell_tax(gross)
+                net = gross - s_fee - tax + tail_adjust
+            elif tx_type == "配息":
+                supp = supp_health(gross)
+                remit = REMITTANCE_FEE
+                net = gross - supp - remit + tail_adjust
+            else:
+                gross = 0.0
+                unit_price = 0.0
+                net = tail_adjust
+            conn.execute(
+                """UPDATE trades SET trade_date = ?, unit_price = ?, shares = ?, gross = ?,
+                   buy_fee = ?, sell_fee = ?, tax = ?, supp_health = ?, remittance = ?,
+                   net_cash_flow = ?, why_buy = ?, stop_loss = ?, reason_change = ?, why_sold = ?
+                   WHERE id = ?""",
+                (
+                    item["trade_date"].isoformat(), unit_price, shares, gross,
+                    b_fee, s_fee, tax, supp, remit, net,
+                    item["why_buy"], stop_loss, item["reason_change"], item["why_sold"], trade_id,
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def delete_trades(trade_ids):
+    """一次刪除所選交易紀錄。"""
+    ids = tuple(dict.fromkeys(int(trade_id) for trade_id in trade_ids))
+    if not ids:
+        return 0
+
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = conn.execute(
+            f"DELETE FROM trades WHERE id IN ({placeholders})", ids
+        )
+        conn.commit()
+        return cursor.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def load_trades():
     """由 SQLite 讀取全部交易，依日期與 id 排序（供重放計算持股與一條龍對帳單）。"""
     cur = conn.execute(
@@ -332,12 +413,12 @@ def replay_holdings():
             h["總成本"] -= cost_out
             h["股數"] -= sh
             h["現金流淨額"] += t["net_cash_flow"]
-            h["已實現損益"] += t["net_cash_flow"] + cost_out  # 現金流入 + 釋出成本
+            h["已實現損益"] += t["net_cash_flow"] + cost_out
             h["交易"].append({
                 "交易日期": t["trade_date"], "交易類型": "賣出", "成交單價": t["unit_price"],
                 "成交股數": sh, "成交金額": t["gross"], "手續費(賣)": t["sell_fee"],
-                "證交稅": t["tax"], "淨現金流": t["net_cash_flow"], "實現損益": t["net_cash_flow"] + cost_out,
-                "說明": t["note"] or "",
+                "證交稅": t["tax"], "淨現金流": t["net_cash_flow"],
+                "實現損益": t["net_cash_flow"] + cost_out, "說明": t["note"] or "",
             })
         elif tt == "配息":
             h["現金流淨額"] += t["net_cash_flow"]
@@ -347,7 +428,7 @@ def replay_holdings():
                 "跨行匯費": t["remittance"], "淨現金流": t["net_cash_flow"], "說明": t["note"] or "",
             })
         elif tt == "配股":
-            h["股數"] += sh  # 庫存股數增加；總成本不變 → 均價自動攤薄
+            h["股數"] += sh
             h["除權息"].append({
                 "日期": t["trade_date"], "類型": "股票配股", "配股股數": sh, "單位": "股",
                 "增資後股數": h["股數"], "說明": t["note"] or "",
@@ -560,26 +641,28 @@ def tint(values, color_of):
 
 
 def _ledger_row_style(tx_types):
-    """一條龍對帳單的「橫向色彩分流」：依每列交易類型決定整列文字/背景色。
-
-      - 買進：亮綠字 #00E676 ＋ 深綠底
-      - 賣出：亮紅字 #FF4B4B ＋ 深紅底
-      - 除權息／配股：純白字 #FFFFFF（乾淨）
-    回傳可直接交給 df.style.apply(..., axis=None) 的函式。
-    """
-    BUY_BG = "background-color: rgba(0,200,90,0.20); color:#00E676;"
-    SELL_BG = "background-color: rgba(255,60,60,0.18); color:#FF4B4B;"
+    """一條龍對帳單依交易類型為整列文字上色。"""
+    BUY_STYLE = "color:#00E676; font-weight:600;"
+    SELL_STYLE = "color:#FF4B4B; font-weight:600;"
     DIV_STYLE = "color:#FFFFFF;"
 
     def style_fn(df):
         out = pd.DataFrame("", index=df.index, columns=df.columns)
+        summary_columns = {
+            "交易日期", "剩餘成本", "庫存股數", "打平成本預估單價", "預留即時現價",
+        }
         for i, tt in enumerate(tx_types):
             if i >= len(out):
                 break
             if tt == "買進":
-                out.iloc[i] = BUY_BG
+                out.iloc[i] = BUY_STYLE
             elif tt == "賣出":
-                out.iloc[i] = SELL_BG
+                out.iloc[i] = SELL_STYLE
+            elif tt == "結轉":
+                out.iloc[i] = DIV_STYLE
+                for column in out.columns:
+                    if column not in summary_columns and column not in ("刪除", "_trade_id"):
+                        out.loc[out.index[i], column] = "color:#07070a;"
             else:
                 out.iloc[i] = DIV_STYLE
         return out
@@ -740,7 +823,7 @@ LEDGER_COLUMNS = [
     # 賣出區
     "賣出單價", "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額",
     # 除權息區
-    "股息發放", "20K以上二代健保2.11%", "(匯費/手續費)", "實際領到",
+    "股息發放", "配股股數", "20K以上二代健保2.11%", "(匯費/手續費)", "實際領到",
     # 庫存打成本區
     "剩餘成本", "庫存股數", "打平成本預估單價", "帳上收益", "預留即時現價", "投資報酬率",
     # 策略備註區
@@ -748,11 +831,9 @@ LEDGER_COLUMNS = [
 ]
 LEDGER_BUY_COLS = ["購買單價", "購買股數", "購買金額", "手續費", "購買成本"]
 LEDGER_SELL_COLS = ["賣出單價", "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額"]
-LEDGER_DIV_COLS = ["股息發放", "20K以上二代健保2.11%", "(匯費/手續費)", "實際領到"]
+LEDGER_DIV_COLS = ["股息發放", "配股股數", "20K以上二代健保2.11%", "(匯費/手續費)", "實際領到"]
 LEDGER_INV_COLS = ["剩餘成本", "庫存股數", "打平成本預估單價", "帳上收益", "預留即時現價", "投資報酬率"]
 LEDGER_NOTE_COLS = ["Why buy", "停損價位", "Reason price change", "Why sold"]
-
-
 def build_trade_ledger(code: str):
     """把單一股票的所有交易展開成「橫向一條龍對帳單」（list[dict]，對齊 LEDGER_COLUMNS）。
 
@@ -781,6 +862,9 @@ def build_trade_ledger(code: str):
         r = {c: 0 for c in LEDGER_COLUMNS}          # 預設 0（Numbers 空白以 0 呈現）
         r["交易日期"] = t["trade_date"]
         r["預留即時現價"] = round(price, 2)
+        r["_trade_id"] = t["id"]
+        r["_unit_price"] = up
+        r["_shares"] = sh
 
         if tt == "買進":
             buy_amount = gross
@@ -816,6 +900,7 @@ def build_trade_ledger(code: str):
 
         elif tt == "配股":
             running_shares += sh                     # 配股：股數照加、單價 0 → 均價自動攤薄
+            r["配股股數"] = sh
 
         # 庫存打成本區（逐列帶出滾動後狀態）
         avg_cost = (running_cost / running_shares) if running_shares > 0 else 0.0
@@ -1091,53 +1176,289 @@ elif get_stock(st.session_state.page) is not None:
 
     # ---------- 橫向一條龍對帳單（單一 st.dataframe，欄位 100% 對齊 Numbers） ----------
     st.subheader("🧮 交易對帳單（橫向一條龍 · trade_ledger）")
-    st.caption("買進＝綠底、賣出＝紅底、除權息＝白字。計費為國泰 28 折真實試算；可用表格右上角 ⋯ 複製貼到 Numbers。")
+    st.caption("買進文字為綠色、賣出文字為紅色、除權息文字為白色。計費為國泰 28 折真實試算；按左上「複製」可貼到 Numbers。")
 
     ledger_rows, latest = build_trade_ledger(code)
     if ledger_rows:
-        tx_types = [r.pop("_tx_type", "配息") for r in ledger_rows]
-        ledger_df = pd.DataFrame(ledger_rows)[LEDGER_COLUMNS]
-
-        # 橫向色彩分流：整列依交易類型上色（買進綠 / 賣出紅 / 除權息白）
-        ledger_styler = (
-            ledger_df.style
+        trade_ids = []
+        trade_sources = {}
+        for ledger_row in ledger_rows:
+            trade_id = ledger_row.pop("_trade_id")
+            trade_ids.append(trade_id)
+            trade_sources[trade_id] = {
+                "tx_type": ledger_row.pop("_tx_type", "配息"),
+                "unit_price": ledger_row.pop("_unit_price"),
+                "shares": ledger_row.pop("_shares"),
+                "gross": ledger_row.get("股息發放", 0),
+            }
+        tx_types = [trade_sources[trade_id]["tx_type"] for trade_id in trade_ids]
+        ledger_df = pd.DataFrame(ledger_rows, index=trade_ids)[LEDGER_COLUMNS]
+        ledger_df["交易日期"] = pd.to_datetime(ledger_df["交易日期"]).dt.strftime("%Y-%m-%d")
+        summary_row = {column: 0 for column in LEDGER_COLUMNS}
+        summary_row.update({
+            "交易日期": "最新結轉",
+            "剩餘成本": latest["剩餘成本"],
+            "庫存股數": latest["庫存股數"],
+            "打平成本預估單價": latest["打平成本預估單價"],
+            "預留即時現價": latest["現價"],
+        })
+        for column in ("Why buy", "Reason price change", "Why sold"):
+            summary_row[column] = ""
+        summary_df = pd.DataFrame([summary_row], columns=LEDGER_COLUMNS)
+        display_df = ledger_df.copy()
+        ledger_formats = {
+            **{
+                column: lambda value: "0" if value == 0 else f"{value:,.2f}"
+                for column in (
+                    "購買單價", "賣出單價", "打平成本預估單價",
+                    "預留即時現價", "停損價位",
+                )
+            },
+            "投資報酬率": lambda value: "0" if value == 0 else f"{value * 100:+.2f}%",
+            "帳上收益": lambda value: "0" if value == 0 else f"{value:+,.0f}",
+            **{
+                column: lambda value: "0" if value == 0 else f"{value:,.0f}"
+                for column in (
+                    "購買股數", "購買金額", "手續費", "購買成本",
+                    "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額",
+                    "股息發放", "配股股數", "20K以上二代健保2.11%", "(匯費/手續費)",
+                    "實際領到", "剩餘成本", "庫存股數",
+                )
+            },
+        }
+        delete_df = ledger_df.copy()
+        delete_df.insert(0, "_trade_id", trade_ids)
+        delete_df.insert(0, "刪除", False)
+        delete_df.reset_index(drop=True, inplace=True)
+        delete_styler = (
+            delete_df.style
             .set_table_styles(STYLER_BASE)
             .apply(_ledger_row_style(tx_types), axis=None)
-            .format({
-                **{
-                    column: lambda value: "0" if value == 0 else f"{value:,.2f}"
-                    for column in (
-                        "購買單價", "賣出單價", "打平成本預估單價",
-                        "預留即時現價", "停損價位",
-                    )
-                },
-                "投資報酬率": lambda value: "0" if value == 0 else f"{value * 100:+.2f}%",
-                "帳上收益": lambda value: "0" if value == 0 else f"{value:+,.0f}",
-                **{
-                    column: lambda value: "0" if value == 0 else f"{value:,.0f}"
-                    for column in (
-                        "購買股數", "購買金額", "手續費", "購買成本",
-                        "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額",
-                        "股息發放", "20K以上二代健保2.11%", "(匯費/手續費)",
-                        "實際領到", "剩餘成本", "庫存股數",
-                    )
-                },
-            }, na_rep="—")
+            .format(ledger_formats, na_rep="—")
         )
-        # 欄寬微調（右側策略備註欄留較寬）
+        clipboard_df = pd.concat(
+            [ledger_df.astype(object), summary_df.astype(object)], ignore_index=True
+        )
+        summary_visible_columns = {
+            "交易日期", "剩餘成本", "庫存股數", "打平成本預估單價", "預留即時現價",
+        }
+        for column in LEDGER_COLUMNS:
+            if column not in summary_visible_columns:
+                clipboard_df.loc[len(clipboard_df) - 1, column] = ""
+        clipboard_tsv = json.dumps(
+                        clipboard_df.to_csv(sep="\t", index=False, header=True, na_rep="")
+                )
+        st.components.v1.html(
+                        f"""
+                        <div style="display:flex;align-items:center;gap:10px;height:36px;font-family:sans-serif;">
+                            <button id="copy-ledger" type="button" style="
+                                padding:5px 12px;border:1px solid rgba(255,255,255,0.16);border-radius:8px;
+                                background:rgba(255,255,255,0.06);color:#e2e2e7;font-size:13px;font-weight:600;
+                                cursor:pointer;">
+                                複製
+                            </button>
+                            <span id="copy-ledger-status" style="color:#a1a1aa;font-size:12px;"></span>
+                        </div>
+                        <script>
+                            const copyButton = document.getElementById("copy-ledger");
+                            const copyStatus = document.getElementById("copy-ledger-status");
+                            const clipboardText = {clipboard_tsv};
+                            copyButton.addEventListener("click", async () => {{
+                                try {{
+                                    try {{
+                                        await navigator.clipboard.writeText(clipboardText);
+                                    }} catch (error) {{
+                                        const textArea = document.createElement("textarea");
+                                        textArea.value = clipboardText;
+                                        textArea.style.position = "fixed";
+                                        textArea.style.left = "-9999px";
+                                        document.body.appendChild(textArea);
+                                        textArea.select();
+                                        const copied = document.execCommand("copy");
+                                        textArea.remove();
+                                        if (!copied) throw error;
+                                    }}
+                                    copyStatus.textContent = "已複製，可貼到 Numbers";
+                                }} catch (error) {{
+                                    copyStatus.textContent = "複製失敗，請檢查瀏覽器剪貼簿權限";
+                                }}
+                            }});
+                        </script>
+                        """,
+                        height=42,
+                        scrolling=False,
+                )
         ledger_cfg = {
+            "_trade_id": None,
+            "刪除": st.column_config.CheckboxColumn("刪除"),
             "交易日期": st.column_config.TextColumn("交易日期", width="small"),
-            "庫存股數": st.column_config.NumberColumn("庫存股數", format="%d"),
+            "庫存股數": st.column_config.TextColumn("庫存股數"),
             "Why buy": st.column_config.TextColumn("Why buy", width="medium"),
             "Reason price change": st.column_config.TextColumn("Reason price change", width="medium"),
             "Why sold": st.column_config.TextColumn("Why sold", width="medium"),
         }
-        show_dataframe(
-            ledger_styler,
+        delete_version_key = f"delete_editor_version_{code}"
+        delete_version = st.session_state.get(delete_version_key, 0)
+        edited_delete_df = st.data_editor(
+            delete_df,
+            width="stretch",
+            hide_index=True,
             column_config=ledger_cfg,
-            caption=(f"最新結轉：庫存 {latest['庫存股數']:,} 股｜打平成本 NT$ {latest['打平成本預估單價']:,.2f}"
-                     f"｜現價 NT$ {latest['現價']:,.2f}｜剩餘成本 NT$ {latest['剩餘成本']:,.0f}"),
+            disabled=["_trade_id", *LEDGER_COLUMNS],
+            num_rows="fixed",
+            key=f"ledger_with_summary_{code}_{delete_version}",
         )
+        selected_delete_ids = [
+            int(trade_id)
+            for trade_id, selected in zip(edited_delete_df["_trade_id"], edited_delete_df["刪除"])
+            if int(trade_id) in trade_sources and not pd.isna(selected) and bool(selected)
+        ]
+        if st.button(
+            "刪除所選交易",
+            key=f"delete_trades_{code}",
+            disabled=not selected_delete_ids,
+            type="secondary",
+        ):
+            delete_trades(selected_delete_ids)
+            st.session_state[delete_version_key] = delete_version + 1
+            st.rerun()
+
+        summary_display_df = pd.DataFrame([{
+            "項目": "最新結轉",
+            "庫存股數": latest["庫存股數"],
+            "打平成本預估單價": latest["打平成本預估單價"],
+            "預留即時現價": latest["現價"],
+            "剩餘成本": latest["剩餘成本"],
+        }])
+        summary_styler = (
+            summary_display_df.style
+            .set_table_styles(STYLER_BASE)
+            .format({
+                "庫存股數": "{:,}",
+                "打平成本預估單價": "{:,.2f}",
+                "預留即時現價": "{:,.2f}",
+                "剩餘成本": "{:,.0f}",
+            })
+        )
+        st.dataframe(
+            summary_styler,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "項目": st.column_config.TextColumn("項目"),
+                "庫存股數": st.column_config.NumberColumn("庫存股數", format="%d"),
+                "打平成本預估單價": st.column_config.NumberColumn("打平成本預估單價 (NT$)", format="%.2f"),
+                "預留即時現價": st.column_config.NumberColumn("現價 (NT$)", format="%.2f"),
+                "剩餘成本": st.column_config.NumberColumn("剩餘成本 (NT$)", format="%,.0f"),
+            },
+            height=90,
+        )
+
+        with st.expander("修改交易紀錄", expanded=False):
+            def _trade_option(trade_id):
+                source = trade_sources[trade_id]
+                tx_type = source["tx_type"]
+                if tx_type == "配息":
+                    detail = f"股息 {source['gross']:,.2f}"
+                elif tx_type == "配股":
+                    detail = f"配股 {source['shares']:,} 股"
+                else:
+                    detail = f"{source['unit_price']:,.2f} × {source['shares']:,} 股"
+                return f"{ledger_df.loc[trade_id, '交易日期']}｜{tx_type}｜{detail}"
+
+            selected_trade_id = st.selectbox(
+                "選擇要修改的交易",
+                options=trade_ids,
+                format_func=_trade_option,
+                key=f"edit_trade_select_{code}",
+            )
+            selected_source = trade_sources[selected_trade_id]
+            selected_row = ledger_df.loc[selected_trade_id]
+            selected_type = selected_source["tx_type"]
+
+            with st.form(f"edit_trade_form_{code}_{selected_trade_id}"):
+                edited_date = st.date_input(
+                    "交易日期",
+                    value=date.fromisoformat(selected_row["交易日期"]),
+                    key=f"edit_date_{code}_{selected_trade_id}",
+                )
+                edit_price = float(selected_source["unit_price"])
+                edit_shares = int(selected_source["shares"])
+                edit_dividend = float(selected_source["gross"])
+                if selected_type == "買進":
+                    price_col, shares_col = st.columns(2)
+                    with price_col:
+                        edit_price = st.number_input(
+                            "購買單價", min_value=0.01, value=edit_price, step=0.01,
+                            format="%.2f", key=f"edit_buy_price_{code}_{selected_trade_id}",
+                        )
+                    with shares_col:
+                        edit_shares = st.number_input(
+                            "購買股數", min_value=1, value=edit_shares, step=1,
+                            key=f"edit_buy_shares_{code}_{selected_trade_id}",
+                        )
+                elif selected_type == "賣出":
+                    price_col, shares_col = st.columns(2)
+                    with price_col:
+                        edit_price = st.number_input(
+                            "賣出單價", min_value=0.01, value=edit_price, step=0.01,
+                            format="%.2f", key=f"edit_sell_price_{code}_{selected_trade_id}",
+                        )
+                    with shares_col:
+                        edit_shares = st.number_input(
+                            "賣出股數", min_value=1, value=edit_shares, step=1,
+                            key=f"edit_sell_shares_{code}_{selected_trade_id}",
+                        )
+                elif selected_type == "配息":
+                    edit_dividend = st.number_input(
+                        "股息發放", min_value=0.0, value=edit_dividend, step=1.0,
+                        format="%.2f", key=f"edit_dividend_{code}_{selected_trade_id}",
+                    )
+                elif selected_type == "配股":
+                    edit_shares = st.number_input(
+                        "配股股數", min_value=1, value=edit_shares, step=1,
+                        key=f"edit_bonus_shares_{code}_{selected_trade_id}",
+                    )
+
+                note_col, reason_col = st.columns(2)
+                with note_col:
+                    why_buy = st.text_input(
+                        "Why buy", value=str(selected_row["Why buy"] or ""),
+                        key=f"edit_why_buy_{code}_{selected_trade_id}",
+                    )
+                    reason_change = st.text_input(
+                        "Reason price change", value=str(selected_row["Reason price change"] or ""),
+                        key=f"edit_reason_change_{code}_{selected_trade_id}",
+                    )
+                with reason_col:
+                    stop_loss = st.number_input(
+                        "停損價位", min_value=0.0, value=float(selected_row["停損價位"]),
+                        step=0.05, format="%.2f", key=f"edit_stop_loss_{code}_{selected_trade_id}",
+                    )
+                    why_sold = st.text_input(
+                        "Why sold", value=str(selected_row["Why sold"] or ""),
+                        key=f"edit_why_sold_{code}_{selected_trade_id}",
+                    )
+                save_edit = st.form_submit_button("儲存修改並重算", type="primary", width="stretch")
+
+            if save_edit:
+                if selected_type == "配息":
+                    edit_price = edit_dividend / edit_shares if edit_shares else 0.0
+                try:
+                    update_trades([{
+                        "id": selected_trade_id,
+                        "trade_date": edited_date,
+                        "unit_price": edit_price,
+                        "shares": edit_shares,
+                        "why_buy": why_buy,
+                        "stop_loss": stop_loss,
+                        "reason_change": reason_change,
+                        "why_sold": why_sold,
+                    }])
+                    st.rerun()
+                except (TypeError, ValueError) as error:
+                    st.error(str(error))
+
     else:
         st.info("尚無交易紀錄，請於首頁手動記帳表單新增。")
 
@@ -1157,25 +1478,31 @@ with st.sidebar:
     st.button("📊 總表（簡易統計總表）", key="nav_stats", width="stretch",
               type="primary" if st.session_state.page == "stats" else "secondary", on_click=go_stats)
     st.divider()
-    st.markdown('<div class="numbers-title">持股清單</div>', unsafe_allow_html=True)
-    st.caption("點擊表格中任一列即可切換至該公司流水帳。")
-
     # ---- 持股清單：用 st.button 清單（見下方說明為何不用 st.dataframe 選取）----
     st.markdown('<div class="nav-h">持股清單</div>', unsafe_allow_html=True)
     st.caption("點擊任一檔即可切換至該公司流水帳。")
 
+    _name_counts = {}
+    for _c in st.session_state.sidebar_codes:
+        _name = stock_company_name(_c)
+        _name_counts[_name] = _name_counts.get(_name, 0) + 1
+
     for _i, _c in enumerate(st.session_state.sidebar_codes):
         _active = st.session_state.page == _c
+        _name = stock_company_name(_c)
+        if _name_counts[_name] > 1:
+            _name = "名稱待確認"
         st.button(
-            f"{_c}  {stock_company_name(_c)}",
+            f"{_c}  {_name}",
             key=f"nav_pick_{_c}",
             width="stretch",
             type="primary" if _active else "secondary",
             on_click=pick_stock,
             args=(_c,),
-            help=f"切換到 {stock_label(_c)} 的流水帳",
         )
 
     st.caption("上下排序可在個股頁右上角的【🔼 往上移一格 / 🔽 往下移一格】調整。")
     st.divider()
     st.caption("數據持久化於 stock.db（SQLite）。表格右上角 ⋯ 可複製貼到 Numbers。")
+
+    
