@@ -1049,7 +1049,7 @@ if st.session_state.page == "home":
                 tx_type = st.radio("交易類型", ("買進", "賣出", "配息", "配股"), horizontal=True)
             with f_row2[1]:
                 unit_price = st.number_input("成交單價 / 每股配息（元）", min_value=0.0,
-                                             value=0.0, step=1.0, format="%.0f",
+                                             value=0.0, step=0.01, format="%.2f",
                                              help="買賣＝成交單價；配息＝每股配息；配股＝0（不影響單價）")
             with f_row2[2]:
                 shares = st.number_input("成交股數 / 配息股數（股）", min_value=0, value=0,
