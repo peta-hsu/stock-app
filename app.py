@@ -413,7 +413,7 @@ def replay_holdings():
             h["總成本"] -= cost_out
             h["股數"] -= sh
             h["現金流淨額"] += t["net_cash_flow"]
-            h["已實現損益"] += t["net_cash_flow"] + cost_out
+            h["已實現損益"] += t["net_cash_flow"] - cost_out
             h["交易"].append({
                 "交易日期": t["trade_date"], "交易類型": "賣出", "成交單價": t["unit_price"],
                 "成交股數": sh, "成交金額": t["gross"], "手續費(賣)": t["sell_fee"],
@@ -649,7 +649,7 @@ def _ledger_row_style(tx_types):
     def style_fn(df):
         out = pd.DataFrame("", index=df.index, columns=df.columns)
         summary_columns = {
-            "交易日期", "剩餘成本", "庫存股數", "打平成本預估單價", "預留即時現價",
+            "交易日期", "剩餘成本", "庫存股數",
         }
         for i, tt in enumerate(tx_types):
             if i >= len(out):
@@ -846,14 +846,14 @@ LEDGER_COLUMNS = [
     # 除權息區
     "股息發放", "配股股數", "20K以上二代健保2.11%", "(匯費/手續費)", "實際領到",
     # 庫存打成本區
-    "剩餘成本", "庫存股數", "打平成本預估單價", "帳上收益", "預留即時現價", "投資報酬率",
+    "剩餘成本", "庫存股數", "投資報酬率",
     # 策略備註區
     "Why buy", "停損價位", "Reason price change", "Why sold",
 ]
 LEDGER_BUY_COLS = ["購買單價", "購買股數", "購買金額", "手續費", "購買成本"]
 LEDGER_SELL_COLS = ["賣出單價", "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額"]
 LEDGER_DIV_COLS = ["股息發放", "配股股數", "20K以上二代健保2.11%", "(匯費/手續費)", "實際領到"]
-LEDGER_INV_COLS = ["剩餘成本", "庫存股數", "打平成本預估單價", "帳上收益", "預留即時現價", "投資報酬率"]
+LEDGER_INV_COLS = ["剩餘成本", "庫存股數", "投資報酬率"]
 LEDGER_NOTE_COLS = ["Why buy", "停損價位", "Reason price change", "Why sold"]
 def build_trade_ledger(code: str):
     """把單一股票的所有交易展開成「橫向一條龍對帳單」（list[dict]，對齊 LEDGER_COLUMNS）。
@@ -882,7 +882,6 @@ def build_trade_ledger(code: str):
 
         r = {c: None for c in LEDGER_COLUMNS}       # 預設 None（畫面呈現乾淨空白）
         r["交易日期"] = t["trade_date"]
-        r["預留即時現價"] = round(price, 2)
         r["_trade_id"] = t["id"]
         r["_unit_price"] = up
         r["_shares"] = sh
@@ -927,8 +926,6 @@ def build_trade_ledger(code: str):
         avg_cost = (running_cost / running_shares) if running_shares > 0 else 0.0
         r["剩餘成本"] = running_cost
         r["庫存股數"] = running_shares
-        r["打平成本預估單價"] = round(avg_cost, 2)
-        r["帳上收益"] = (price - avg_cost) * running_shares if running_shares > 0 else 0.0
         r["投資報酬率"] = ((price - avg_cost) / avg_cost) if (running_shares > 0 and avg_cost > 0) else 0.0
 
         # 策略備註區
@@ -943,7 +940,6 @@ def build_trade_ledger(code: str):
     latest = {
         "剩餘成本": running_cost,
         "庫存股數": running_shares,
-        "打平成本預估單價": round((running_cost / running_shares) if running_shares > 0 else 0.0, 2),
         "現價": price,
     }
     return rows, latest
@@ -1147,7 +1143,7 @@ elif st.session_state.page == "stats":
                 "市值": _fmt_stat_number,
                 "損益金額": lambda v: _fmt_stat_number(v, signed=True),
                 "損益比例": _fmt_stat_ratio,
-                "已實現損益": lambda v: _fmt_stat_number(v, signed=True),
+                "已實現損益": lambda v: _fmt_stat_number(v, signed=True, force_int=True),
                 "總成本": _fmt_stat_number,
             }, na_rep="—")
         )
@@ -1192,7 +1188,7 @@ elif get_stock(st.session_state.page) is not None:
     st.caption(f"個股明細 · 數據持久化於 stock.db" + (f" · 現價來源：TWSE {_src}" if _src else ""))
 
     row = holding_row(code)
-    d_cost, d_market, d_pnl = st.columns(3, gap="large")
+    d_cost, d_market, d_pnl, d_realized = st.columns(4, gap="large")
     with d_cost:
         st.metric("持股均價（打成本）", value=f"NT$ {row['均價']:,.2f}" if row else "—",
                   delta=f"庫存 {row['股數']:,} 股" if row else None, border=True,
@@ -1207,6 +1203,12 @@ elif get_stock(st.session_state.page) is not None:
                       delta_color="inverse", border=True, help="紅＝賺錢、綠＝賠錢")
         else:
             st.metric("未實現損益", value="—", border=True)
+    with d_realized:
+        if row:
+            st.metric("已實現損益", value=f"NT$ {row['已實現損益']:+,.0f}",
+                      border=True, help="累計已實現交易損益（賣出結算）")
+        else:
+            st.metric("已實現損益", value="—", border=True)
 
     st.divider()
 
@@ -1235,8 +1237,6 @@ elif get_stock(st.session_state.page) is not None:
             "交易日期": "最新結轉",
             "剩餘成本": latest["剩餘成本"],
             "庫存股數": latest["庫存股數"],
-            "打平成本預估單價": latest["打平成本預估單價"],
-            "預留即時現價": latest["現價"],
         })
         for column in ("Why buy", "Reason price change", "Why sold"):
             summary_row[column] = ""
@@ -1246,12 +1246,11 @@ elif get_stock(st.session_state.page) is not None:
             **{
                 column: lambda value: "" if value == 0 else f"{value:,.2f}"
                 for column in (
-                    "購買單價", "賣出單價", "打平成本預估單價",
-                    "預留即時現價", "停損價位",
+                    "購買單價", "賣出單價",
+                    "停損價位",
                 )
             },
             "投資報酬率": lambda value: "" if value == 0 else f"{value * 100:+.2f}%",
-            "帳上收益": lambda value: "" if value == 0 else f"{value:+,.0f}",
             **{
                 column: lambda value: "" if value == 0 else f"{value:,.0f}"
                 for column in (
@@ -1276,7 +1275,7 @@ elif get_stock(st.session_state.page) is not None:
             [ledger_df.astype(object), summary_df.astype(object)], ignore_index=True
         )
         summary_visible_columns = {
-            "交易日期", "剩餘成本", "庫存股數", "打平成本預估單價", "預留即時現價",
+            "交易日期", "剩餘成本", "庫存股數",
         }
         for column in LEDGER_COLUMNS:
             if column not in summary_visible_columns:
@@ -1389,64 +1388,36 @@ elif get_stock(st.session_state.page) is not None:
                 edit_df[_zc] = pd.to_numeric(edit_df[_zc], errors="coerce")
                 edit_df[_zc] = edit_df[_zc].where(edit_df[_zc] != 0, float("nan"))
 
-        edited_df = st.data_editor(
-            edit_df,
+        # ---------------- 已實現損益對帳單（樣式化顯示）------------
+        st.dataframe(
+            delete_styler[LEDGER_COLUMNS],
             width="stretch",
             hide_index=True,
-            column_config=_column_config,
-            disabled=_disabled,
-            num_rows="fixed",
-            key=f"ledger_editor_{code}_{_restore_version}",
+            height=400,
         )
 
         _bs, _br, _bd = st.columns([1.6, 1.6, 2])
         with _bs:
-            if st.button("儲存修改", key=f"save_ledger_{code}", type="primary"):
-                updates = []
-                for _, row in edited_df.iterrows():
-                    tid = int(row["_trade_id"])
-                    if tid not in trade_sources:
-                        continue
-                    src = trade_sources[tid]
-                    updates.append({
-                        "id": tid,
-                        "trade_date": row["交易日期"],
-                        "unit_price": float(row["購買單價"]) if pd.notna(row.get("購買單價")) else src["unit_price"],
-                        "shares": int(float(row["購買股數"])) if pd.notna(row.get("購買股數")) else src["shares"],
-                        "stop_loss": float(row["停損價位"]) if pd.notna(row.get("停損價位")) else 0.0,
-                        "why_buy": str(row.get("Why buy", "") or ""),
-                        "reason_change": str(row.get("Reason price change", "") or ""),
-                        "why_sold": str(row.get("Why sold", "") or ""),
-                    })
-                if updates:
-                    update_trades(updates)
-                    st.session_state[_restore_key] = _restore_version + 1
-                    st.rerun()
+            st.button("回復原始資料", key=f"restore_ledger_{code}",
+                      on_click=lambda: st.session_state.update({_restore_key: _restore_version + 1}))
         with _br:
-            if st.button("回復原始資料", key=f"restore_ledger_{code}"):
-                st.session_state[_restore_key] = _restore_version + 1
-                st.rerun()
+            st.empty()
         with _bd:
-            selected_delete_ids = [
-                int(trade_id)
-                for trade_id, selected in zip(edited_df["_trade_id"], edited_df["刪除"])
-                if int(trade_id) in trade_sources and not pd.isna(selected) and bool(selected)
-            ]
-            if st.button(
-                "刪除所選交易",
-                key=f"delete_trades_{code}",
-                disabled=not selected_delete_ids,
-                type="secondary",
-            ):
-                delete_trades(selected_delete_ids)
+            _del_id = st.selectbox(
+                "刪除交易（選擇 ID）",
+                options=[None] + trade_ids,
+                format_func=lambda x: "—" if x is None else f"{x}｜{ledger_df.loc[x, '交易日期']}",
+                key=f"delete_select_{code}",
+            )
+            if st.button("確認刪除所選交易", key=f"delete_trades_{code}",
+                         disabled=_del_id is None, type="secondary"):
+                delete_trades([_del_id])
                 st.session_state[_restore_key] = _restore_version + 1
                 st.rerun()
 
         summary_display_df = pd.DataFrame([{
             "項目": "最新結轉",
             "庫存股數": latest["庫存股數"],
-            "打平成本預估單價": latest["打平成本預估單價"],
-            "預留即時現價": latest["現價"],
             "剩餘成本": latest["剩餘成本"],
         }])
         summary_styler = (
@@ -1454,8 +1425,6 @@ elif get_stock(st.session_state.page) is not None:
             .set_table_styles(STYLER_BASE)
             .format({
                 "庫存股數": "{:,}",
-                "打平成本預估單價": "{:,.2f}",
-                "預留即時現價": "{:,.2f}",
                 "剩餘成本": "{:,.0f}",
             })
         )
@@ -1466,8 +1435,6 @@ elif get_stock(st.session_state.page) is not None:
             column_config={
                 "項目": st.column_config.TextColumn("項目"),
                 "庫存股數": st.column_config.NumberColumn("庫存股數", format="%d"),
-                "打平成本預估單價": st.column_config.NumberColumn("打平成本預估單價 (NT$)", format="%.2f"),
-                "預留即時現價": st.column_config.NumberColumn("現價 (NT$)", format="%.2f"),
                 "剩餘成本": st.column_config.NumberColumn("剩餘成本 (NT$)", format="%,.0f"),
             },
             height=90,
