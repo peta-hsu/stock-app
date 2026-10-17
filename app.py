@@ -734,18 +734,21 @@ def _sync_code_to_name():
     code = st.session_state.get("manual_stock_code", "").strip()
     if not code:
         st.session_state["manual_stock_name"] = ""
+        st.rerun()
         return
     name = stock_company_name(code)
     # 查無此股時，stock_company_name 會回傳代號本身；避免將代號誤寫為公司名稱（如 2320 2320）
     if name == code:
         name = ""
     st.session_state["manual_stock_name"] = name
+    st.rerun()
 
 
 def _sync_name_to_code():
     name = st.session_state.get("manual_stock_name", "").strip()
     code = _REVERSE_NAMES.get(name, "") if name else ""
     st.session_state["manual_stock_code"] = code
+    st.rerun()
 
 
 def stock_label(code: str) -> str:
@@ -818,9 +821,13 @@ def refresh_prices():
 
 
 def holding_row(code: str):
-    """計算單檔持股市值與損益（以重放後的股數/均價 + 現價）。"""
+    """計算單檔持股市值與損益（以重放後的股數/均價 + 現價）。
+
+    若庫存為 0 但有交易紀錄，仍回傳一列（股數/市值/損益皆為 0），
+    讓統計總表能完整列出所有有交易紀錄的個股。
+    """
     h = get_stock(code)
-    if h is None or h["股數"] <= 0:
+    if h is None:
         return None
     price = current_price(code)
     shares = h["股數"]
@@ -991,8 +998,8 @@ if st.session_state.page == "home":
     )
     st.html(f'<div style="margin-bottom: 6px;">{pills_html}</div>')
 
-    # 三張大數據卡片
-    rows = [r for c in codes if (r := holding_row(c)) is not None]
+    # 三張大數據卡片（僅顯示庫存大於 0 的個股）
+    rows = [r for c in codes if (r := holding_row(c)) is not None and r["股數"] > 0]
     total_cost = sum(r["總成本"] for r in rows)
     total_market = sum(r["市值"] for r in rows)
     total_pnl = total_market - total_cost
