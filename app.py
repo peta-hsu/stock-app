@@ -311,7 +311,7 @@ def update_trades(updates):
                    net_cash_flow = ?, why_buy = ?, stop_loss = ?, reason_change = ?, why_sold = ?
                    WHERE id = ?""",
                 (
-                    item["trade_date"].isoformat(), unit_price, shares, gross,
+                    (item["trade_date"].isoformat() if hasattr(item["trade_date"], "isoformat") else str(item["trade_date"])), unit_price, shares, gross,
                     b_fee, s_fee, tax, supp, remit, net,
                     item["why_buy"], stop_loss, item["reason_change"], item["why_sold"], trade_id,
                 ),
@@ -727,6 +727,27 @@ def stock_company_name(code: str) -> str:
     return name
 
 
+_REVERSE_NAMES = {name: code for code, name in COMMON_NAMES.items()}
+
+
+def _sync_code_to_name():
+    code = st.session_state.get("manual_stock_code", "").strip()
+    if not code:
+        st.session_state["manual_stock_name"] = ""
+        return
+    name = stock_company_name(code)
+    # 查無此股時，stock_company_name 會回傳代號本身；避免將代號誤寫為公司名稱（如 2320 2320）
+    if name == code:
+        name = ""
+    st.session_state["manual_stock_name"] = name
+
+
+def _sync_name_to_code():
+    name = st.session_state.get("manual_stock_name", "").strip()
+    code = _REVERSE_NAMES.get(name, "") if name else ""
+    st.session_state["manual_stock_code"] = code
+
+
 def stock_label(code: str) -> str:
     return f"{code} {stock_company_name(code)}"
 
@@ -859,7 +880,7 @@ def build_trade_ledger(code: str):
         up = float(t["unit_price"])
         gross = float(t["gross"])
 
-        r = {c: 0 for c in LEDGER_COLUMNS}          # 預設 0（Numbers 空白以 0 呈現）
+        r = {c: None for c in LEDGER_COLUMNS}       # 預設 None（畫面呈現乾淨空白）
         r["交易日期"] = t["trade_date"]
         r["預留即時現價"] = round(price, 2)
         r["_trade_id"] = t["id"]
@@ -1005,20 +1026,30 @@ if st.session_state.page == "home":
     # -------------------- 手動記帳表單（國泰計費 · 三大卡片下方 · expander 預設展開） --------------------
     st.divider()
     with st.expander("🖊️ 手動新增股票交易 / 除權息紀錄表單", expanded=True):
-        with st.form("manual_entry"):
+        with st.container():
             f_row1 = st.columns(3)
             with f_row1[0]:
                 trade_date = st.date_input("交易日期", value=date.today())
             with f_row1[1]:
-                stock_code = st.text_input("股票代號", placeholder="例如：2330")
+                stock_code = st.text_input(
+                    "股票代號",
+                    key="manual_stock_code",
+                    placeholder="例如：2330",
+                    on_change=_sync_code_to_name,
+                )
             with f_row1[2]:
-                stock_name = st.text_input("股票名稱", placeholder="例如：台積電")
+                stock_name = st.text_input(
+                    "股票名稱",
+                    key="manual_stock_name",
+                    placeholder="例如：台積電",
+                    on_change=_sync_name_to_code,
+                )
             f_row2 = st.columns(4)
             with f_row2[0]:
                 tx_type = st.radio("交易類型", ("買進", "賣出", "配息", "配股"), horizontal=True)
             with f_row2[1]:
                 unit_price = st.number_input("成交單價 / 每股配息（元）", min_value=0.0,
-                                             value=0.0, step=0.05, format="%.4f",
+                                             value=0.0, step=1.0, format="%.0f",
                                              help="買賣＝成交單價；配息＝每股配息；配股＝0（不影響單價）")
             with f_row2[2]:
                 shares = st.number_input("成交股數 / 配息股數（股）", min_value=0, value=0,
@@ -1044,7 +1075,7 @@ if st.session_state.page == "home":
             with s_row2[1]:
                 why_sold = st.text_input("Why sold（出場理由）", key="f_why_sold",
                                          placeholder="例如：達目標價、觸及停損…")
-            submitted = st.form_submit_button("提交紀錄", type="primary", width="stretch")
+            submitted = st.button("提交紀錄", type="primary", width="stretch")
 
         if submitted:
             code = stock_code.strip()
@@ -1088,24 +1119,29 @@ elif st.session_state.page == "stats":
         }
         stats_df = pd.DataFrame(rows + [total_row])
 
-        def _fmt_stat_number(v, signed=False):
+        def _fmt_stat_number(v, signed=False, force_int=False):
             if pd.isna(v):
                 return "—"
             if v == 0:
                 return "0"
-            return f"{v:+,.2f}" if signed else f"{v:,.2f}"
+            if force_int or float(v).is_integer():
+                return f"{int(v):,d}"
+            text = f"{v:+,.2f}" if signed else f"{v:,.2f}"
+            return text.rstrip("0").rstrip(".")
 
         def _fmt_stat_ratio(v):
             if pd.isna(v):
                 return "—"
-            return "0" if v == 0 else f"{v * 100:+.2f}%"
+            if v == 0:
+                return "0"
+            return f"{v * 100:+.2f}%"
 
         stats_styler = (
             stats_df.style
             .set_table_styles(STYLER_BASE)
             .apply(tint, subset=["損益金額", "損益比例"], color_of=lambda v: GAIN if v >= 0 else LOSS)
             .format({
-                "股數": _fmt_stat_number,
+                "股數": lambda v: _fmt_stat_number(v, force_int=True),
                 "均價": _fmt_stat_number,
                 "現價": _fmt_stat_number,
                 "市值": _fmt_stat_number,
@@ -1118,8 +1154,8 @@ elif st.session_state.page == "stats":
         show_dataframe(
             stats_styler,
             column_config={
-                "代號": st.column_config.TextColumn("代號", width="small"),
-                "名稱": st.column_config.TextColumn("名稱", width="small"),
+                "代號": st.column_config.TextColumn("代號"),
+                "名稱": st.column_config.TextColumn("名稱"),
                 "股數": st.column_config.TextColumn("股數"),
                 "均價": st.column_config.TextColumn("均價（NT$）"),
                 "現價": st.column_config.TextColumn("現價（NT$）"),
@@ -1208,16 +1244,16 @@ elif get_stock(st.session_state.page) is not None:
         display_df = ledger_df.copy()
         ledger_formats = {
             **{
-                column: lambda value: "0" if value == 0 else f"{value:,.2f}"
+                column: lambda value: "" if value == 0 else f"{value:,.2f}"
                 for column in (
                     "購買單價", "賣出單價", "打平成本預估單價",
                     "預留即時現價", "停損價位",
                 )
             },
-            "投資報酬率": lambda value: "0" if value == 0 else f"{value * 100:+.2f}%",
-            "帳上收益": lambda value: "0" if value == 0 else f"{value:+,.0f}",
+            "投資報酬率": lambda value: "" if value == 0 else f"{value * 100:+.2f}%",
+            "帳上收益": lambda value: "" if value == 0 else f"{value:+,.0f}",
             **{
-                column: lambda value: "0" if value == 0 else f"{value:,.0f}"
+                column: lambda value: "" if value == 0 else f"{value:,.0f}"
                 for column in (
                     "購買股數", "購買金額", "手續費", "購買成本",
                     "賣出股數", "賣出金額", "證券商手續費", "政府證券交易稅", "實收金額",
@@ -1248,80 +1284,163 @@ elif get_stock(st.session_state.page) is not None:
         clipboard_tsv = json.dumps(
                         clipboard_df.to_csv(sep="\t", index=False, header=True, na_rep="")
                 )
-        st.components.v1.html(
-                        f"""
-                        <div style="display:flex;align-items:center;gap:10px;height:36px;font-family:sans-serif;">
-                            <button id="copy-ledger" type="button" style="
-                                padding:5px 12px;border:1px solid rgba(255,255,255,0.16);border-radius:8px;
-                                background:rgba(255,255,255,0.06);color:#e2e2e7;font-size:13px;font-weight:600;
-                                cursor:pointer;">
-                                複製
-                            </button>
-                            <span id="copy-ledger-status" style="color:#a1a1aa;font-size:12px;"></span>
-                        </div>
-                        <script>
-                            const copyButton = document.getElementById("copy-ledger");
-                            const copyStatus = document.getElementById("copy-ledger-status");
-                            const clipboardText = {clipboard_tsv};
-                            copyButton.addEventListener("click", async () => {{
-                                try {{
+        # ---------------- 複製按鈕與快捷鍵（並排） ----------------
+        _c0, _c1, _c2, _c3, _c4 = st.columns([1, 1, 1, 1, 1])
+        with _c0:
+            st.components.v1.html(
+                            f"""
+                            <div style="display:flex;align-items:center;gap:10px;height:36px;font-family:sans-serif;">
+                                <button id="copy-ledger" type="button" style="
+                                    padding:5px 12px;border:1px solid rgba(255,255,255,0.16);border-radius:8px;
+                                    background:rgba(255,255,255,0.06);color:#e2e2e7;font-size:13px;font-weight:600;
+                                    cursor:pointer;">
+                                    複製表格
+                                </button>
+                                <span id="copy-ledger-status" style="color:#a1a1aa;font-size:12px;"></span>
+                            </div>
+                            <script>
+                                const copyButton = document.getElementById("copy-ledger");
+                                const copyStatus = document.getElementById("copy-ledger-status");
+                                const clipboardText = {clipboard_tsv};
+                                copyButton.addEventListener("click", async () => {{
                                     try {{
-                                        await navigator.clipboard.writeText(clipboardText);
+                                        try {{
+                                            await navigator.clipboard.writeText(clipboardText);
+                                        }} catch (error) {{
+                                            const textArea = document.createElement("textarea");
+                                            textArea.value = clipboardText;
+                                            textArea.style.position = "fixed";
+                                            textArea.style.left = "-9999px";
+                                            document.body.appendChild(textArea);
+                                            textArea.select();
+                                            const copied = document.execCommand("copy");
+                                            textArea.remove();
+                                            if (!copied) throw error;
+                                        }}
+                                        copyStatus.textContent = "已複製，可貼到 Numbers";
                                     }} catch (error) {{
-                                        const textArea = document.createElement("textarea");
-                                        textArea.value = clipboardText;
-                                        textArea.style.position = "fixed";
-                                        textArea.style.left = "-9999px";
-                                        document.body.appendChild(textArea);
-                                        textArea.select();
-                                        const copied = document.execCommand("copy");
-                                        textArea.remove();
-                                        if (!copied) throw error;
+                                        copyStatus.textContent = "複製失敗，請檢查瀏覽器剪貼簿權限";
                                     }}
-                                    copyStatus.textContent = "已複製，可貼到 Numbers";
-                                }} catch (error) {{
-                                    copyStatus.textContent = "複製失敗，請檢查瀏覽器剪貼簿權限";
-                                }}
-                            }});
-                        </script>
-                        """,
-                        height=42,
-                        scrolling=False,
-                )
-        ledger_cfg = {
-            "_trade_id": None,
-            "刪除": st.column_config.CheckboxColumn("刪除"),
-            "交易日期": st.column_config.TextColumn("交易日期", width="small"),
-            "庫存股數": st.column_config.TextColumn("庫存股數"),
-            "Why buy": st.column_config.TextColumn("Why buy", width="medium"),
-            "Reason price change": st.column_config.TextColumn("Reason price change", width="medium"),
-            "Why sold": st.column_config.TextColumn("Why sold", width="medium"),
+                                }});
+                            </script>
+                            """,
+                            height=42,
+                            scrolling=False,
+                    )
+        with _c1:
+            show_buy = st.toggle("買股資訊", value=True, key=f"toggle_buy_{code}")
+        with _c2:
+            show_sell = st.toggle("賣股資訊", value=True, key=f"toggle_sell_{code}")
+        with _c3:
+            show_inv = st.toggle("庫存資訊", value=True, key=f"toggle_inv_{code}")
+        with _c4:
+            show_note = st.toggle("其他", value=True, key=f"toggle_note_{code}")
+
+        _core_cols = {"交易日期", "購買單價", "購買股數"}
+        _visible_set = set(_core_cols)
+        if show_buy:
+            _visible_set.update(LEDGER_BUY_COLS)
+        if show_sell:
+            _visible_set.update(LEDGER_SELL_COLS)
+        if show_inv:
+            _visible_set.update(LEDGER_INV_COLS)
+        if show_note:
+            _visible_set.update(LEDGER_NOTE_COLS)
+        _visible_cols = [c for c in LEDGER_COLUMNS if c in _visible_set]
+
+        # ---------------- 可編輯對帳單 ----------------
+        _restore_key = f"ledger_restore_version_{code}"
+        _restore_version = st.session_state.get(_restore_key, 0)
+
+        edit_df = ledger_df[_visible_cols].copy()
+        edit_df.insert(0, "_trade_id", trade_ids)
+        edit_df.insert(0, "刪除", False)
+        edit_df.reset_index(drop=True, inplace=True)
+
+        _editable = {
+            "交易日期", "購買單價", "購買股數", "手續費",
+            "賣出單價", "賣出股數", "證券商手續費", "政府證券交易稅",
+            "股息發放", "配股股數", "20K以上二代健保2.11%", "(匯費/手續費)",
+            "Why buy", "停損價位", "Reason price change", "Why sold",
         }
-        delete_version_key = f"delete_editor_version_{code}"
-        delete_version = st.session_state.get(delete_version_key, 0)
-        edited_delete_df = st.data_editor(
-            delete_df,
+        _disabled = ["_trade_id"] + [c for c in _visible_cols if c not in _editable]
+
+        _column_config = {"_trade_id": None, "刪除": st.column_config.CheckboxColumn("刪除")}
+        for _c in _visible_cols:
+            if _c in {"Why buy", "Reason price change", "Why sold"}:
+                _column_config[_c] = st.column_config.TextColumn(_c)
+            elif _c == "交易日期":
+                _column_config[_c] = st.column_config.TextColumn(_c)
+            else:
+                _column_config[_c] = st.column_config.NumberColumn(_c)
+
+        # 零值轉空白：非核心欄位的 0/None/NaN 全部轉為空白格子
+        # - 數值欄位 (NumberColumn)：轉為 float64，0/None/NaN → float("nan")，渲染為空白
+        # - 文字欄位 (TextColumn)：None/NaN/"None" 字串 → ""，渲染為空白
+        _zero_blank_cols = [
+            c for c in edit_df.columns
+            if c not in _core_cols and c not in ("_trade_id", "刪除", "交易日期")
+        ]
+        for _zc in _zero_blank_cols:
+            if _zc in {"Why buy", "Reason price change", "Why sold"}:
+                edit_df[_zc] = edit_df[_zc].fillna("").astype(str)
+                edit_df[_zc] = edit_df[_zc].replace({"None": "", "nan": ""})
+            else:
+                edit_df[_zc] = pd.to_numeric(edit_df[_zc], errors="coerce")
+                edit_df[_zc] = edit_df[_zc].where(edit_df[_zc] != 0, float("nan"))
+
+        edited_df = st.data_editor(
+            edit_df,
             width="stretch",
             hide_index=True,
-            column_config=ledger_cfg,
-            disabled=["_trade_id", *LEDGER_COLUMNS],
+            column_config=_column_config,
+            disabled=_disabled,
             num_rows="fixed",
-            key=f"ledger_with_summary_{code}_{delete_version}",
+            key=f"ledger_editor_{code}_{_restore_version}",
         )
-        selected_delete_ids = [
-            int(trade_id)
-            for trade_id, selected in zip(edited_delete_df["_trade_id"], edited_delete_df["刪除"])
-            if int(trade_id) in trade_sources and not pd.isna(selected) and bool(selected)
-        ]
-        if st.button(
-            "刪除所選交易",
-            key=f"delete_trades_{code}",
-            disabled=not selected_delete_ids,
-            type="secondary",
-        ):
-            delete_trades(selected_delete_ids)
-            st.session_state[delete_version_key] = delete_version + 1
-            st.rerun()
+
+        _bs, _br, _bd = st.columns([1.6, 1.6, 2])
+        with _bs:
+            if st.button("儲存修改", key=f"save_ledger_{code}", type="primary"):
+                updates = []
+                for _, row in edited_df.iterrows():
+                    tid = int(row["_trade_id"])
+                    if tid not in trade_sources:
+                        continue
+                    src = trade_sources[tid]
+                    updates.append({
+                        "id": tid,
+                        "trade_date": row["交易日期"],
+                        "unit_price": float(row["購買單價"]) if pd.notna(row.get("購買單價")) else src["unit_price"],
+                        "shares": int(float(row["購買股數"])) if pd.notna(row.get("購買股數")) else src["shares"],
+                        "stop_loss": float(row["停損價位"]) if pd.notna(row.get("停損價位")) else 0.0,
+                        "why_buy": str(row.get("Why buy", "") or ""),
+                        "reason_change": str(row.get("Reason price change", "") or ""),
+                        "why_sold": str(row.get("Why sold", "") or ""),
+                    })
+                if updates:
+                    update_trades(updates)
+                    st.session_state[_restore_key] = _restore_version + 1
+                    st.rerun()
+        with _br:
+            if st.button("回復原始資料", key=f"restore_ledger_{code}"):
+                st.session_state[_restore_key] = _restore_version + 1
+                st.rerun()
+        with _bd:
+            selected_delete_ids = [
+                int(trade_id)
+                for trade_id, selected in zip(edited_df["_trade_id"], edited_df["刪除"])
+                if int(trade_id) in trade_sources and not pd.isna(selected) and bool(selected)
+            ]
+            if st.button(
+                "刪除所選交易",
+                key=f"delete_trades_{code}",
+                disabled=not selected_delete_ids,
+                type="secondary",
+            ):
+                delete_trades(selected_delete_ids)
+                st.session_state[_restore_key] = _restore_version + 1
+                st.rerun()
 
         summary_display_df = pd.DataFrame([{
             "項目": "最新結轉",
@@ -1384,7 +1503,7 @@ elif get_stock(st.session_state.page) is not None:
                 )
                 edit_price = float(selected_source["unit_price"])
                 edit_shares = int(selected_source["shares"])
-                edit_dividend = float(selected_source["gross"])
+                edit_dividend = float(selected_source["gross"]) if selected_source["gross"] is not None else 0.0
                 if selected_type == "買進":
                     price_col, shares_col = st.columns(2)
                     with price_col:
@@ -1502,6 +1621,65 @@ with st.sidebar:
         )
 
     st.caption("上下排序可在個股頁右上角的【🔼 往上移一格 / 🔽 往下移一格】調整。")
+
+    # ---- 管理個股清單：刪除 / 修改代號與名稱 ----
+    st.divider()
+    _sm_key = "sidebar_manage_mode"
+    if _sm_key not in st.session_state:
+        st.session_state[_sm_key] = False
+
+    if st.button(
+        "🔧 管理個股清單" if not st.session_state[_sm_key] else "✖ 關閉管理",
+        key="sidebar_manage_toggle",
+        width="stretch",
+    ):
+        st.session_state[_sm_key] = not st.session_state[_sm_key]
+        st.rerun()
+
+    if st.session_state[_sm_key]:
+        st.caption("修改代號/名稱後按「儲存修改」同步至 stock.db；勾選刪除會移除該股所有交易紀錄。")
+        _sm_edit = {}
+        _sm_del = {}
+        for _si, _sc in enumerate(list(st.session_state.sidebar_codes)):
+            _s1, _s2, _s3 = st.columns([2, 3, 1])
+            with _s1:
+                _nc = st.text_input("代號", value=_sc, key=f"sm_code_{_si}", label_visibility="collapsed")
+            with _s2:
+                _nn = st.text_input("名稱", value=stock_company_name(_sc), key=f"sm_name_{_si}", label_visibility="collapsed")
+            with _s3:
+                _dl = st.checkbox("刪除", key=f"sm_del_{_si}")
+            _sm_edit[_sc] = (_nc.strip(), _nn.strip())
+            _sm_del[_sc] = bool(_dl)
+
+        _sc1, _sc2 = st.columns(2)
+        with _sc1:
+            if st.button("💾 儲存修改", key="sm_save_btn", type="primary", width="stretch"):
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for _old_c, (_new_c, _new_name) in _sm_edit.items():
+                        if _sm_del.get(_old_c):
+                            conn.execute("DELETE FROM trades WHERE stock_code = ?", (_old_c,))
+                            if _old_c in st.session_state.sidebar_codes:
+                                st.session_state.sidebar_codes.remove(_old_c)
+                        elif _new_c != _old_c or _new_name != stock_company_name(_old_c):
+                            conn.execute(
+                                "UPDATE trades SET stock_code = ?, stock_name = ? WHERE stock_code = ?",
+                                (_new_c, _new_name or _new_c, _old_c),
+                            )
+                            if _old_c in st.session_state.sidebar_codes:
+                                _idx = st.session_state.sidebar_codes.index(_old_c)
+                                st.session_state.sidebar_codes[_idx] = _new_c
+                    conn.commit()
+                    st.session_state[_sm_key] = False
+                    st.rerun()
+                except Exception:
+                    conn.rollback()
+                    raise
+        with _sc2:
+            if st.button("↩ 回復原始資料", key="sm_restore_btn", width="stretch"):
+                st.session_state[_sm_key] = False
+                st.rerun()
+
     st.divider()
     st.caption("數據持久化於 stock.db（SQLite）。表格右上角 ⋯ 可複製貼到 Numbers。")
 

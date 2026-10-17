@@ -1,0 +1,4 @@
+# Streamlit 最新語法守則
+- 禁用 use_container_width=True，一律改用 width="stretch"。
+- 禁用 st.components.v1.html，一律改用 st.iframe。
+- 個股對帳單表格內的 0 必須呈現完全空白 ""；首頁成交單價則預設呈現整數 0。
