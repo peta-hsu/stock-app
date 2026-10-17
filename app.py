@@ -1265,8 +1265,9 @@ elif get_stock(st.session_state.page) is not None:
         delete_df.insert(0, "_trade_id", trade_ids)
         delete_df.insert(0, "刪除", False)
         delete_df.reset_index(drop=True, inplace=True)
+        delete_display = delete_df[LEDGER_COLUMNS].copy()
         delete_styler = (
-            delete_df.style
+            delete_display.style
             .set_table_styles(STYLER_BASE)
             .apply(_ledger_row_style(tx_types), axis=None)
             .format(ledger_formats, na_rep="—")
@@ -1390,7 +1391,7 @@ elif get_stock(st.session_state.page) is not None:
 
         # ---------------- 已實現損益對帳單（樣式化顯示）------------
         st.dataframe(
-            delete_styler[LEDGER_COLUMNS],
+            delete_styler,
             width="stretch",
             hide_index=True,
             height=400,
