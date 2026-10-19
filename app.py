@@ -15,9 +15,9 @@ import math
 import json
 import random
 from datetime import date, datetime
+from urllib.parse import urlparse
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from pg8000.native import Connection
 
 import pandas as pd
 import requests
@@ -162,40 +162,46 @@ def fetch_twse_price(code: str):
 
 
 # ================================================================== PostgreSQL 持久化 (Neon / Supabase)
-# 所有交易資料儲存於 PostgreSQL 的 trades 表，透過 psycopg2 直接讀寫。
+# 所有交易資料儲存於 PostgreSQL 的 trades 表，透過純 Python pg8000.native 直接讀寫。
 # 需在 .streamlit/secrets.toml 中設定 database.url（PostgreSQL 連接字串，免 JSON 金鑰）。
-DB_URL = st.secrets["database"]["url"]
-conn = psycopg2.connect(DB_URL)
+_db_url = st.secrets["database"]["url"]
+_parsed = urlparse(_db_url)
+conn = Connection(
+    user=_parsed.username,
+    password=_parsed.password,
+    host=_parsed.hostname,
+    port=_parsed.port or 5432,
+    database=_parsed.path.lstrip("/"),
+)
 
 # 建立交易表（若不存在）；欄位與原 SQLite trades 表完全一致
-with conn.cursor() as _cur:
-    _cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            trade_date TEXT NOT NULL,
-            stock_code TEXT NOT NULL,
-            stock_name TEXT,
-            tx_type TEXT NOT NULL,            -- 買進 / 賣出 / 配息 / 配股
-            unit_price REAL NOT NULL DEFAULT 0,
-            shares INTEGER NOT NULL DEFAULT 0,
-            gross REAL NOT NULL DEFAULT 0,     -- 成交金額（買/賣）或現金股利總額（配息）
-            buy_fee REAL NOT NULL DEFAULT 0,
-            sell_fee REAL NOT NULL DEFAULT 0,
-            tax REAL NOT NULL DEFAULT 0,
-            supp_health REAL NOT NULL DEFAULT 0,
-            remittance REAL NOT NULL DEFAULT 0,
-            tail_adjust REAL NOT NULL DEFAULT 0,
-            net_cash_flow REAL NOT NULL DEFAULT 0,  -- 帶正負號：+ 現金流入 / - 現金流出
-            note TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            why_buy TEXT,
-            stop_loss REAL DEFAULT 0,          -- 停損價位
-            reason_change TEXT,                -- Reason price change（價格變動原因）
-            why_sold TEXT                      -- Why sold（出場理由）
-        )
-        """
+conn.run(
+    """
+    CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
+        trade_date TEXT NOT NULL,
+        stock_code TEXT NOT NULL,
+        stock_name TEXT,
+        tx_type TEXT NOT NULL,            -- 買進 / 賣出 / 配息 / 配股
+        unit_price REAL NOT NULL DEFAULT 0,
+        shares INTEGER NOT NULL DEFAULT 0,
+        gross REAL NOT NULL DEFAULT 0,     -- 成交金額（買/賣）或現金股利總額（配息）
+        buy_fee REAL NOT NULL DEFAULT 0,
+        sell_fee REAL NOT NULL DEFAULT 0,
+        tax REAL NOT NULL DEFAULT 0,
+        supp_health REAL NOT NULL DEFAULT 0,
+        remittance REAL NOT NULL DEFAULT 0,
+        tail_adjust REAL NOT NULL DEFAULT 0,
+        net_cash_flow REAL NOT NULL DEFAULT 0,  -- 帶正負號：+ 現金流入 / - 現金流出
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        why_buy TEXT,
+        stop_loss REAL DEFAULT 0,          -- 停損價位
+        reason_change TEXT,                -- Reason price change（價格變動原因）
+        why_sold TEXT                      -- Why sold（出場理由）
     )
+    """
+)
 conn.commit()
 
 TRADE_COLUMNS = [
@@ -208,10 +214,9 @@ TRADE_COLUMNS = [
 
 
 def _row_to_dict(row) -> dict:
-    """將 psycopg2 RealDictCursor 的 Row 轉為純 Python dict，並將 None 轉為適當預設值。"""
+    """將 pg8000 回傳的列表列轉為純 Python dict，並將 None 轉為適當預設值。"""
     d = {}
-    for c in TRADE_COLUMNS:
-        v = row.get(c)
+    for c, v in zip(TRADE_COLUMNS, row):
         if v is None:
             v = 0.0 if c in ("unit_price", "shares", "gross", "buy_fee", "sell_fee",
                              "tax", "supp_health", "remittance", "tail_adjust",
@@ -253,17 +258,21 @@ def record_trade(trade_date, code, name, tx_type, unit_price, shares, tail_adjus
 
     trade_date_str = trade_date.isoformat() if hasattr(trade_date, "isoformat") else str(trade_date)
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """INSERT INTO trades
-               (trade_date, stock_code, stock_name, tx_type, unit_price, shares, gross,
-                buy_fee, sell_fee, tax, supp_health, remittance, tail_adjust, net_cash_flow, note,
-                why_buy, stop_loss, reason_change, why_sold)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (trade_date_str, code, name, tx_type, float(unit_price), shares, gross,
-             b_fee, s_fee, tax, supp, remit, float(tail_adjust), net, note or "",
-             why_buy or "", float(stop_loss or 0.0), reason_change or "", why_sold or ""),
-        )
+    conn.run(
+        """INSERT INTO trades
+           (trade_date, stock_code, stock_name, tx_type, unit_price, shares, gross,
+            buy_fee, sell_fee, tax, supp_health, remittance, tail_adjust, net_cash_flow, note,
+            why_buy, stop_loss, reason_change, why_sold)
+           VALUES (:trade_date, :code, :name, :tx_type, :unit_price, :shares, :gross,
+                   :buy_fee, :sell_fee, :tax, :supp_health, :remittance, :tail_adjust, :net_cash_flow, :note,
+                   :why_buy, :stop_loss, :reason_change, :why_sold)""",
+        trade_date=trade_date_str, code=code, name=name, tx_type=tx_type,
+        unit_price=float(unit_price), shares=shares, gross=gross,
+        buy_fee=b_fee, sell_fee=s_fee, tax=tax, supp_health=supp, remittance=remit,
+        tail_adjust=float(tail_adjust), net_cash_flow=net, note=note or "",
+        why_buy=why_buy or "", stop_loss=float(stop_loss or 0.0),
+        reason_change=reason_change or "", why_sold=why_sold or "",
+    )
     conn.commit()
     return {
         "gross": gross, "buy_fee": b_fee, "sell_fee": s_fee, "tax": tax,
@@ -273,78 +282,79 @@ def record_trade(trade_date, code, name, tx_type, unit_price, shares, tail_adjus
 
 def update_trades(updates):
     """更新流水帳原始欄位，並依交易類型重算所有費用與淨現金流（寫回 PostgreSQL）。"""
-    with conn.cursor() as cur:
-        for item in updates:
-            trade_id = int(item["id"])
-            cur.execute("SELECT tx_type, tail_adjust FROM trades WHERE id = %s", (trade_id,))
-            existing = cur.fetchone()
-            if existing is None:
-                raise ValueError(f"找不到交易紀錄：{trade_id}")
+    for item in updates:
+        trade_id = int(item["id"])
+        rows = conn.run("SELECT tx_type, tail_adjust FROM trades WHERE id = :id", id=trade_id)
+        if not rows:
+            raise ValueError(f"找不到交易紀錄：{trade_id}")
 
-            tx_type, tail_adjust = existing
-            tail_adjust = float(tail_adjust or 0.0)
-            unit_price = float(item["unit_price"])
-            shares_value = float(item["shares"])
-            stop_loss = float(item.get("stop_loss", 0.0))
-            if not all(math.isfinite(value) for value in (unit_price, shares_value, stop_loss)):
-                raise ValueError("價格、股數與停損價位必須是有效數字")
-            if shares_value <= 0 or not shares_value.is_integer():
-                raise ValueError("股數必須是大於 0 的整數")
-            if stop_loss < 0:
-                raise ValueError("停損價位不可小於 0")
-            if (tx_type in ("買進", "賣出") and unit_price <= 0) or (
-                tx_type == "配息" and unit_price < 0
-            ):
-                raise ValueError("交易單價必須大於 0，股息金額不可小於 0")
+        existing = rows[0]
+        tx_type, tail_adjust = existing
+        tail_adjust = float(tail_adjust or 0.0)
+        unit_price = float(item["unit_price"])
+        shares_value = float(item["shares"])
+        stop_loss = float(item.get("stop_loss", 0.0))
+        if not all(math.isfinite(value) for value in (unit_price, shares_value, stop_loss)):
+            raise ValueError("價格、股數與停損價位必須是有效數字")
+        if shares_value <= 0 or not shares_value.is_integer():
+            raise ValueError("股數必須是大於 0 的整數")
+        if stop_loss < 0:
+            raise ValueError("停損價位不可小於 0")
+        if (tx_type in ("買進", "賣出") and unit_price <= 0) or (
+            tx_type == "配息" and unit_price < 0
+        ):
+            raise ValueError("交易單價必須大於 0，股息金額不可小於 0")
 
-            shares = int(shares_value)
-            gross = unit_price * shares
+        shares = int(shares_value)
+        gross = unit_price * shares
 
-            # 手續費／稅費：優先使用修改表單傳入的實際值，未傳入則依國泰公式重算
-            b_fee = item.get("buy_fee")
-            s_fee = item.get("sell_fee")
-            tax = item.get("tax")
-            supp = item.get("supp_health")
-            remit = item.get("remittance")
-            if b_fee is None:
-                b_fee = buy_fee(gross) if tx_type == "買進" else 0.0
-            if s_fee is None:
-                s_fee = sell_fee(gross) if tx_type == "賣出" else 0.0
-            if tax is None:
-                tax = sell_tax(gross) if tx_type == "賣出" else 0.0
-            if supp is None:
-                supp = supp_health(gross) if tx_type == "配息" else 0.0
-            if remit is None:
-                remit = REMITTANCE_FEE if tx_type == "配息" else 0.0
-            b_fee = float(b_fee or 0.0)
-            s_fee = float(s_fee or 0.0)
-            tax = float(tax or 0.0)
-            supp = float(supp or 0.0)
-            remit = float(remit or 0.0)
+        # 手續費／稅費：優先使用修改表單傳入的實際值，未傳入則依國泰公式重算
+        b_fee = item.get("buy_fee")
+        s_fee = item.get("sell_fee")
+        tax = item.get("tax")
+        supp = item.get("supp_health")
+        remit = item.get("remittance")
+        if b_fee is None:
+            b_fee = buy_fee(gross) if tx_type == "買進" else 0.0
+        if s_fee is None:
+            s_fee = sell_fee(gross) if tx_type == "賣出" else 0.0
+        if tax is None:
+            tax = sell_tax(gross) if tx_type == "賣出" else 0.0
+        if supp is None:
+            supp = supp_health(gross) if tx_type == "配息" else 0.0
+        if remit is None:
+            remit = REMITTANCE_FEE if tx_type == "配息" else 0.0
+        b_fee = float(b_fee or 0.0)
+        s_fee = float(s_fee or 0.0)
+        tax = float(tax or 0.0)
+        supp = float(supp or 0.0)
+        remit = float(remit or 0.0)
 
-            if tx_type == "買進":
-                net = -(gross + b_fee) + tail_adjust
-            elif tx_type == "賣出":
-                net = gross - s_fee - tax + tail_adjust
-            elif tx_type == "配息":
-                net = gross - supp - remit + tail_adjust
-            else:
-                gross = 0.0
-                unit_price = 0.0
-                net = tail_adjust
+        if tx_type == "買進":
+            net = -(gross + b_fee) + tail_adjust
+        elif tx_type == "賣出":
+            net = gross - s_fee - tax + tail_adjust
+        elif tx_type == "配息":
+            net = gross - supp - remit + tail_adjust
+        else:
+            gross = 0.0
+            unit_price = 0.0
+            net = tail_adjust
 
-            trade_date_str = item["trade_date"].isoformat() if hasattr(item["trade_date"], "isoformat") else str(item["trade_date"])
+        trade_date_str = item["trade_date"].isoformat() if hasattr(item["trade_date"], "isoformat") else str(item["trade_date"])
 
-            cur.execute(
-                """UPDATE trades SET trade_date = %s, unit_price = %s, shares = %s, gross = %s,
-                   buy_fee = %s, sell_fee = %s, tax = %s, supp_health = %s, remittance = %s,
-                   net_cash_flow = %s, why_buy = %s, stop_loss = %s, reason_change = %s, why_sold = %s
-                   WHERE id = %s""",
-                (trade_date_str, unit_price, shares, gross,
-                 b_fee, s_fee, tax, supp, remit, net,
-                 item.get("why_buy", ""), stop_loss, item.get("reason_change", ""), item.get("why_sold", ""),
-                 trade_id),
-            )
+        conn.run(
+            """UPDATE trades SET trade_date = :trade_date, unit_price = :unit_price, shares = :shares, gross = :gross,
+               buy_fee = :buy_fee, sell_fee = :sell_fee, tax = :tax, supp_health = :supp_health, remittance = :remittance,
+               net_cash_flow = :net_cash_flow, why_buy = :why_buy, stop_loss = :stop_loss, reason_change = :reason_change, why_sold = :why_sold
+               WHERE id = :id""",
+            trade_date=trade_date_str, unit_price=unit_price, shares=shares, gross=gross,
+            buy_fee=b_fee, sell_fee=s_fee, tax=tax, supp_health=supp, remittance=remit,
+            net_cash_flow=net,
+            why_buy=item.get("why_buy", ""), stop_loss=stop_loss,
+            reason_change=item.get("reason_change", ""), why_sold=item.get("why_sold", ""),
+            id=trade_id,
+        )
     conn.commit()
 
 
@@ -354,33 +364,37 @@ def delete_trades(trade_ids):
     if not ids:
         return 0
 
-    placeholders = ",".join("%s" for _ in ids)
-    with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM trades WHERE id IN ({placeholders})", ids)
-        rowcount = cur.rowcount
+    # 先查詢會刪除的筆數
+    id_params = {f"id_{i}": id_ for i, id_ in enumerate(ids)}
+    placeholders = ",".join(f":id_{i}" for i in range(len(ids)))
+    count_rows = conn.run(
+        f"SELECT COUNT(*) FROM trades WHERE id IN ({placeholders})", **id_params
+    )
+    delete_count = count_rows[0][0] if count_rows else 0
+
+    conn.run(
+        f"DELETE FROM trades WHERE id IN ({placeholders})", **id_params
+    )
     conn.commit()
-    return rowcount
+    return delete_count
 
 
 def load_trades():
     """由 PostgreSQL 讀取全部交易，依日期與 id 排序（供重放計算持股與一條龍對帳單）。"""
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            "SELECT id, trade_date, stock_code, stock_name, tx_type, unit_price, shares, gross,"
-            " buy_fee, sell_fee, tax, supp_health, remittance, tail_adjust, net_cash_flow, note,"
-            " created_at, why_buy, stop_loss, reason_change, why_sold"
-            " FROM trades ORDER BY trade_date ASC, id ASC"
-        )
-        rows = cur.fetchall()
+    rows = conn.run(
+        "SELECT id, trade_date, stock_code, stock_name, tx_type, unit_price, shares, gross,"
+        " buy_fee, sell_fee, tax, supp_health, remittance, tail_adjust, net_cash_flow, note,"
+        " created_at, why_buy, stop_loss, reason_change, why_sold"
+        " FROM trades ORDER BY trade_date ASC, id ASC"
+    )
     return [_row_to_dict(r) for r in rows]
 
 
 def seed_demo_trades():
     """首次啟動且資料表為空時，寫入示範歷史交易（Mock 假資料，之後即持久化）。"""
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM trades")
-        if cur.fetchone()[0] > 0:
-            return
+    count_rows = conn.run("SELECT COUNT(*) FROM trades")
+    if count_rows[0][0] > 0:
+        return
     demo = [
         ("2024-05-15", "2330", "台積電", "買進", 900.00, 200, "定期定額轉單筆"),
         ("2026-03-04", "2330", "台積電", "賣出", 1042.00, 100, "高檔減碼、實現獲利"),
@@ -1714,20 +1728,19 @@ with st.sidebar:
         with _sc1:
             if st.button("💾 儲存修改", key="sm_save_btn", type="primary", width="stretch"):
                 try:
-                    with conn.cursor() as cur:
-                        for _old_c, (_new_c, _new_name) in _sm_edit.items():
-                            if _sm_del.get(_old_c):
-                                cur.execute("DELETE FROM trades WHERE stock_code = %s", (_old_c,))
-                                if _old_c in st.session_state.sidebar_codes:
-                                    st.session_state.sidebar_codes.remove(_old_c)
-                            elif _new_c != _old_c or _new_name != stock_company_name(_old_c):
-                                cur.execute(
-                                    "UPDATE trades SET stock_code = %s, stock_name = %s WHERE stock_code = %s",
-                                    (_new_c, _new_name or _new_c, _old_c),
-                                )
-                                if _old_c in st.session_state.sidebar_codes:
-                                    _idx = st.session_state.sidebar_codes.index(_old_c)
-                                    st.session_state.sidebar_codes[_idx] = _new_c
+                    for _old_c, (_new_c, _new_name) in _sm_edit.items():
+                        if _sm_del.get(_old_c):
+                            conn.run("DELETE FROM trades WHERE stock_code = :code", code=_old_c)
+                            if _old_c in st.session_state.sidebar_codes:
+                                st.session_state.sidebar_codes.remove(_old_c)
+                        elif _new_c != _old_c or _new_name != stock_company_name(_old_c):
+                            conn.run(
+                                "UPDATE trades SET stock_code = :new_code, stock_name = :new_name WHERE stock_code = :old_code",
+                                new_code=_new_c, new_name=_new_name or _new_c, old_code=_old_c,
+                            )
+                            if _old_c in st.session_state.sidebar_codes:
+                                _idx = st.session_state.sidebar_codes.index(_old_c)
+                                st.session_state.sidebar_codes[_idx] = _new_c
                     conn.commit()
                     st.session_state[_sm_key] = False
                     st.rerun()
