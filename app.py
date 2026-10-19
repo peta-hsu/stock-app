@@ -172,6 +172,7 @@ conn = Connection(
     host=_parsed.hostname,
     port=_parsed.port or 5432,
     database=_parsed.path.lstrip("/"),
+    ssl=True,
 )
 
 # 建立交易表（若不存在）；欄位與原 SQLite trades 表完全一致
