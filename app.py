@@ -14,6 +14,7 @@
 import math
 import json
 import random
+import ssl
 from datetime import date, datetime
 from urllib.parse import urlparse
 
@@ -172,7 +173,7 @@ conn = Connection(
     host=_parsed.hostname,
     port=_parsed.port or 5432,
     database=_parsed.path.lstrip("/"),
-    ssl=True,
+    ssl_context=ssl.create_default_context(),
 )
 
 # 建立交易表（若不存在）；欄位與原 SQLite trades 表完全一致
