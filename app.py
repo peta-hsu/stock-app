@@ -18,6 +18,7 @@ import ssl
 from datetime import date, datetime
 from urllib.parse import urlparse
 
+from pg8000.exceptions import InterfaceError
 from pg8000.native import Connection
 
 import pandas as pd
@@ -165,16 +166,49 @@ def fetch_twse_price(code: str):
 # ================================================================== PostgreSQL 持久化 (Neon / Supabase)
 # 所有交易資料儲存於 PostgreSQL 的 trades 表，透過純 Python pg8000.native 直接讀寫。
 # 需在 .streamlit/secrets.toml 中設定 database.url（PostgreSQL 連接字串，免 JSON 金鑰）。
+# 注意：pg8000 只接受 ssl_context=...，不支援 psycopg 風格的 ssl=True（會直接 TypeError）。
 _db_url = st.secrets["database"]["url"]
 _parsed = urlparse(_db_url)
-conn = Connection(
-    user=_parsed.username,
-    password=_parsed.password,
-    host=_parsed.hostname,
-    port=_parsed.port or 5432,
-    database=_parsed.path.lstrip("/"),
-    ssl_context=ssl.create_default_context(),
-)
+
+_CONN_ARGS = {
+    "user": _parsed.username,
+    "password": _parsed.password,
+    "host": _parsed.hostname,
+    "port": _parsed.port or 5432,
+    "database": _parsed.path.lstrip("/"),
+}
+
+
+def _connect_postgres():
+    """建立 PostgreSQL 連線（Neon 強制 TLS）。
+
+    依序嘗試三種 SSL 設定，遇到「憑證無法驗證」或「伺服器不支援 TLS」才降級，
+    帳密錯誤（DatabaseError 28P01）等真正的失敗會直接拋出，不做無謂重試：
+    1. 系統預設憑證驗證（ssl.create_default_context()）
+    2. 不驗證憑證的寬鬆 TLS（仍加密，只是略過憑證鏈檢查）
+    3. pg8000 預設（ssl_context=None：能 TLS 則 TLS，否則明文）
+    """
+    _loose_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    _loose_ctx.check_hostname = False
+    _loose_ctx.verify_mode = ssl.CERT_NONE
+    for _ctx in (ssl.create_default_context(), _loose_ctx, None):
+        try:
+            return Connection(**_CONN_ARGS, ssl_context=_ctx)
+        except (ssl.SSLCertVerificationError, InterfaceError):
+            if _ctx is None:  # 最後一關仍失敗 → 帶著原始錯誤往外拋
+                raise
+            continue
+
+
+try:
+    conn = _connect_postgres()
+except Exception as _exc:
+    st.error(
+        "PostgreSQL 連線失敗：請檢查 .streamlit/secrets.toml 的 database.url"
+        "（帳號／密碼／主機是否正確，Neon 密碼改過後需同步更新）。\n\n"
+        f"詳細錯誤：{type(_exc).__name__}: {_exc}"
+    )
+    st.stop()
 
 # 建立交易表（若不存在）；欄位與原 SQLite trades 表完全一致
 conn.run(
@@ -204,7 +238,7 @@ conn.run(
     )
     """
 )
-conn.commit()
+# pg8000 每次執行即自動提交（Connection 沒有 commit() 方法，故不呼叫）
 
 TRADE_COLUMNS = [
     "id", "trade_date", "stock_code", "stock_name", "tx_type",
@@ -274,8 +308,8 @@ def record_trade(trade_date, code, name, tx_type, unit_price, shares, tail_adjus
         tail_adjust=float(tail_adjust), net_cash_flow=net, note=note or "",
         why_buy=why_buy or "", stop_loss=float(stop_loss or 0.0),
         reason_change=reason_change or "", why_sold=why_sold or "",
+# pg8000.native 每次執行即自動提交（Connection 沒有 commit() 方法，故不呼叫）
     )
-    conn.commit()
     return {
         "gross": gross, "buy_fee": b_fee, "sell_fee": s_fee, "tax": tax,
         "supp_health": supp, "remittance": remit, "tail_adjust": float(tail_adjust), "net": net,
@@ -357,11 +391,12 @@ def update_trades(updates):
             reason_change=item.get("reason_change", ""), why_sold=item.get("why_sold", ""),
             id=trade_id,
         )
-    conn.commit()
-
-
-def delete_trades(trade_ids):
-    """一次刪除所選交易紀錄（寫回 PostgreSQL）。"""
+    # pg8000 每次執行即自動提交（Connection 沒有 commit() 方法，故不呼叫）
+    return {
+        "gross": gross, "buy_fee": b_fee, "sell_fee": s_fee, "tax": tax,
+        "supp_health": supp, "remittance": remit,
+        "tail_adjust": float(tail_adjust), "net": net,
+    }
     ids = tuple(dict.fromkeys(int(trade_id) for trade_id in trade_ids))
     if not ids:
         return 0
@@ -377,7 +412,7 @@ def delete_trades(trade_ids):
     conn.run(
         f"DELETE FROM trades WHERE id IN ({placeholders})", **id_params
     )
-    conn.commit()
+    # pg8000 每次執行即自動提交（Connection 沒有 commit() 方法，故不呼叫）
     return delete_count
 
 
@@ -1743,12 +1778,12 @@ with st.sidebar:
                             if _old_c in st.session_state.sidebar_codes:
                                 _idx = st.session_state.sidebar_codes.index(_old_c)
                                 st.session_state.sidebar_codes[_idx] = _new_c
-                    conn.commit()
+
                     st.session_state[_sm_key] = False
                     st.rerun()
                 except Exception:
-                    conn.rollback()
-                    raise
+                    st.error(f"同步至 PostgreSQL 失敗：{type(_exc).__name__}: {_exc}")
+                    st.stop()
         with _sc2:
             if st.button("↩ 回復原始資料", key="sm_restore_btn", width="stretch"):
                 st.session_state[_sm_key] = False
