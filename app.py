@@ -1187,6 +1187,27 @@ if st.session_state.page == "home":
 
 
 
+    # ================================================================ 給自己的未來備忘（修改或新增欄位時必看）
+    _reminder_card = (
+        '<div style="border:1px solid #ffa726; background:#fff8e1; border-radius:10px; '
+        'padding:12px 16px; margin-top:14px; font-family:sans-serif;">'
+        '<div style="font-size:0.95rem; font-weight:700; color:#e65100; margin-bottom:8px;">'
+        '⚠️ 修改或新增欄位時的唯一注意事項'
+        '</div>'
+        '<div style="font-size:0.9rem; color:#5d4037; line-height:1.7;">'
+        '⚠️ **未來在 VS Code 修改或新增欄位時的唯一注意事項：**<br><br>'
+        '如果您未來的「新增功能」是想要在對帳單上再增加一個全新的欄位'
+        '（例如：想多記一欄「交易策略標籤」或「匯率」）：<br>'
+        '1. **不能只在 app.py 裡加**。<br>'
+        '2. 必須先用 Cline 或者是自己到 Neon 的網頁後台，在 `trades` 資料表裡執行 SQL 指令多開一個欄位（`ALTER TABLE`）。'
+        '這樣當 `app.py` 把新資料送過去時，雲端資料庫才會有對應的格子可以儲存。<br><br>'
+        '只要資料庫的格子（欄位）和您 `app.py` 的格子對得上，您愛怎麼改程式碼，'
+        '資料就怎麼安全！'
+        '</div>'
+        '</div>'
+    )
+    st.markdown(_reminder_card, unsafe_allow_html=True)
+
 elif st.session_state.page == "stats":
     # ------------------------------------------------------------ 簡易統計總表
     st.title("📊 簡易統計總表")
